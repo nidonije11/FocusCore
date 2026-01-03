@@ -360,7 +360,7 @@ class ControlPanel(QWidget):
         outer.setSpacing(8)
 
         title = QLabel("Controls")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
         outer.addWidget(title)
 
         outer.addWidget(self._section_mode())
@@ -392,7 +392,7 @@ class ControlPanel(QWidget):
         s.setValue(start)
 
         val = QLabel(fmt(start))
-        val.setFixedWidth(52)
+        val.setFixedWidth(60)
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         def _changed(v):
