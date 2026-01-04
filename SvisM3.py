@@ -1,4 +1,7 @@
+#!/usr/bin/env python3
 import sys
+import json
+import time
 import numpy as np
 
 # ===================== Qt =====================
@@ -6,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QGroupBox, QFormLayout, QSlider, QLabel, QPushButton,
     QColorDialog, QComboBox, QCheckBox, QFrame, QSizePolicy,
-    QScrollArea
+    QScrollArea, QFileDialog
 )
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import QTimer, Qt
@@ -32,7 +35,7 @@ def bandpass(low, high, fs, data):
     return lfilter(b, a, data)
 
 
-def audio_callback(indata, frames, time, status):
+def audio_callback(indata, frames, time_info, status):
     """
     Hybrid energy metric:
       energy = 0.7 * RMS + 0.3 * Peak
@@ -88,7 +91,12 @@ class SphereGL(QOpenGLWidget):
         self.camera_orbit = False
 
         # Zoom (camera distance)
-        self.camera_dist = 4.0  # zoom in/out target
+        self.camera_dist = 4.0
+
+        # Model translation (positioning)
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.pos_z = 0.0
 
         # Rotation system: constant + audio-driven + smooth random drift
         self.spin_base = 0.45
@@ -113,8 +121,7 @@ class SphereGL(QOpenGLWidget):
         # Mode
         self.flow_mode = "wormhole"  # "sphere" or "wormhole"
 
-        # ===================== Wormhole (CONTAINED) params =====================
-        # Internal tunnel: a cylindrical throat fully inside the sphere.
+        # Wormhole (contained) params
         self.wh_tunnel_radius = 0.18
         self.wh_mouth_start = 0.60
         self.wh_softness = 0.45
@@ -127,10 +134,108 @@ class SphereGL(QOpenGLWidget):
         self.wire_rings = 24
         self.wire_segments = 36
 
+        # Auto quality (adaptive rendering)
+        self.auto_quality = True
+        self.target_fps = 60
+        self._fps_ema = 60.0
+        self._last_ts = time.perf_counter()
+        self._quality_cooldown = 0.0
+
+        # Hard bounds (don’t let it go crazy)
+        self._min_layers, self._max_layers = 60, 240
+        self._min_segments, self._max_segments = 80, 300
+        self._min_wire_rings, self._max_wire_rings = 10, 80
+        self._min_wire_segments, self._max_wire_segments = 12, 120
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(16)
 
+    # ---------- State Save/Load ----------
+    def get_state(self) -> dict:
+        return {
+            "beat_gain": self.beat_gain,
+            "vocal_gain": self.vocal_gain,
+            "flow_speed": self.flow_speed,
+            "camera_orbit": self.camera_orbit,
+            "camera_dist": self.camera_dist,
+            "pos_x": self.pos_x,
+            "pos_y": self.pos_y,
+            "pos_z": self.pos_z,
+            "spin_base": self.spin_base,
+            "spin_audio": self.spin_audio,
+            "axis_wander": self.axis_wander,
+            "jitter": self.jitter,
+            "axis_x": self.axis_x,
+            "axis_y": self.axis_y,
+            "axis_z": self.axis_z,
+            "mesh_color": list(self.mesh_color),
+            "wire_color": list(self.wire_color),
+            "wire_alpha": self.wire_alpha,
+            "wire_radius": self.wire_radius,
+            "flow_mode": self.flow_mode,
+            "wh_tunnel_radius": self.wh_tunnel_radius,
+            "wh_mouth_start": self.wh_mouth_start,
+            "wh_softness": self.wh_softness,
+            "wh_twist": self.wh_twist,
+            "wh_strength": self.wh_strength,
+            "mesh_layers": int(self.mesh_layers),
+            "mesh_segments": int(self.mesh_segments),
+            "wire_rings": int(self.wire_rings),
+            "wire_segments": int(self.wire_segments),
+            "auto_quality": self.auto_quality,
+            "target_fps": int(self.target_fps),
+        }
+
+    def apply_state(self, s: dict) -> None:
+        # Use .get with current defaults so older preset files still work.
+        self.beat_gain = float(s.get("beat_gain", self.beat_gain))
+        self.vocal_gain = float(s.get("vocal_gain", self.vocal_gain))
+        self.flow_speed = float(s.get("flow_speed", self.flow_speed))
+        self.camera_orbit = bool(s.get("camera_orbit", self.camera_orbit))
+        self.camera_dist = float(s.get("camera_dist", self.camera_dist))
+
+        self.pos_x = float(s.get("pos_x", self.pos_x))
+        self.pos_y = float(s.get("pos_y", self.pos_y))
+        self.pos_z = float(s.get("pos_z", self.pos_z))
+
+        self.spin_base = float(s.get("spin_base", self.spin_base))
+        self.spin_audio = float(s.get("spin_audio", self.spin_audio))
+        self.axis_wander = float(s.get("axis_wander", self.axis_wander))
+        self.jitter = float(s.get("jitter", self.jitter))
+
+        self.axis_x = bool(s.get("axis_x", self.axis_x))
+        self.axis_y = bool(s.get("axis_y", self.axis_y))
+        self.axis_z = bool(s.get("axis_z", self.axis_z))
+
+        mc = s.get("mesh_color", self.mesh_color)
+        wc = s.get("wire_color", self.wire_color)
+        if isinstance(mc, (list, tuple)) and len(mc) == 3:
+            self.mesh_color = [float(mc[0]), float(mc[1]), float(mc[2])]
+        if isinstance(wc, (list, tuple)) and len(wc) == 3:
+            self.wire_color = [float(wc[0]), float(wc[1]), float(wc[2])]
+
+        self.wire_alpha = float(s.get("wire_alpha", self.wire_alpha))
+        self.wire_radius = float(s.get("wire_radius", self.wire_radius))
+        self.flow_mode = str(s.get("flow_mode", self.flow_mode))
+
+        self.wh_tunnel_radius = float(s.get("wh_tunnel_radius", self.wh_tunnel_radius))
+        self.wh_mouth_start = float(s.get("wh_mouth_start", self.wh_mouth_start))
+        self.wh_softness = float(s.get("wh_softness", self.wh_softness))
+        self.wh_twist = float(s.get("wh_twist", self.wh_twist))
+        self.wh_strength = float(s.get("wh_strength", self.wh_strength))
+
+        self.mesh_layers = int(clamp(int(s.get("mesh_layers", self.mesh_layers)), self._min_layers, self._max_layers))
+        self.mesh_segments = int(clamp(int(s.get("mesh_segments", self.mesh_segments)), self._min_segments, self._max_segments))
+        self.wire_rings = int(clamp(int(s.get("wire_rings", self.wire_rings)), self._min_wire_rings, self._max_wire_rings))
+        self.wire_segments = int(clamp(int(s.get("wire_segments", self.wire_segments)), self._min_wire_segments, self._max_wire_segments))
+
+        self.auto_quality = bool(s.get("auto_quality", self.auto_quality))
+        self.target_fps = int(clamp(int(s.get("target_fps", self.target_fps)), 15, 240))
+
+        self.update()
+
+    # ---------- OpenGL ----------
     def initializeGL(self):
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
@@ -145,7 +250,56 @@ class SphereGL(QOpenGLWidget):
         gluPerspective(45, w / max(h, 1), 0.1, 100)
         glMatrixMode(GL_MODELVIEW)
 
+    def _auto_quality_tick(self):
+        """
+        Adaptive quality: keep the look sharp but avoid frame drops.
+        Strategy:
+          - track EMA FPS
+          - if FPS < target*0.92 -> reduce detail (segments/layers)
+          - if FPS > target*1.12 -> increase detail
+          - cooldown so it doesn’t “thrash”
+        """
+        if not self.auto_quality:
+            return
+
+        now = time.perf_counter()
+        dt = now - self._last_ts
+        self._last_ts = now
+
+        if dt <= 0:
+            return
+
+        fps = 1.0 / dt
+        self._fps_ema = 0.92 * self._fps_ema + 0.08 * fps
+
+        # cooldown (seconds)
+        self._quality_cooldown = max(0.0, self._quality_cooldown - dt)
+        if self._quality_cooldown > 0.0:
+            return
+
+        tgt = float(self.target_fps)
+        lo = tgt * 0.92
+        hi = tgt * 1.12
+
+        # Adjust in small steps (keeps visuals stable)
+        if self._fps_ema < lo:
+            # downshift
+            self.mesh_layers = max(self._min_layers, int(self.mesh_layers) - 6)
+            self.mesh_segments = max(self._min_segments, int(self.mesh_segments) - 10)
+            self.wire_rings = max(self._min_wire_rings, int(self.wire_rings) - 2)
+            self.wire_segments = max(self._min_wire_segments, int(self.wire_segments) - 2)
+            self._quality_cooldown = 0.35
+        elif self._fps_ema > hi:
+            # upshift (more sharpness / definition)
+            self.mesh_layers = min(self._max_layers, int(self.mesh_layers) + 6)
+            self.mesh_segments = min(self._max_segments, int(self.mesh_segments) + 10)
+            self.wire_rings = min(self._max_wire_rings, int(self.wire_rings) + 2)
+            self.wire_segments = min(self._max_wire_segments, int(self.wire_segments) + 2)
+            self._quality_cooldown = 0.45
+
     def paintGL(self):
+        self._auto_quality_tick()
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
 
@@ -157,18 +311,18 @@ class SphereGL(QOpenGLWidget):
         else:
             glTranslatef(0, 0, -float(self.camera_dist))
 
-        # Audio scalar driver
+        # Model position (viewable/controllable)
+        glTranslatef(float(self.pos_x), float(self.pos_y), float(self.pos_z))
+
         audio = beat_energy * self.beat_gain * 0.6 + vocal_energy * self.vocal_gain * 0.6
         audio = float(np.clip(audio, 0.0, 2.0))
 
-        # Keep global scale subtle
         scale = 1.0 + audio * 0.22
         glScalef(scale, scale, scale)
 
         self.time_offset += self.flow_speed
         t = self.time_offset
 
-        # Rotation: constant + audio + smooth axis drift
         ax = np.sin(t * 0.37) * self.axis_wander + np.sin(t * 1.33) * self.jitter
         ay = np.cos(t * 0.29) * self.axis_wander + np.cos(t * 1.11) * self.jitter
         az = np.sin(t * 0.41) * self.axis_wander + np.cos(t * 0.97) * self.jitter
@@ -315,20 +469,38 @@ class SphereGL(QOpenGLWidget):
 # ===================== UI Helpers =====================
 class ControlPanel(QWidget):
     """
-    Top side menu bar controls (wide + short).
-    Put this widget inside a horizontal QScrollArea.
+    Top menu bar controls (wide + short).
+    Put inside a horizontal QScrollArea.
+    Includes:
+      - Save/Load tuning state to JSON
+      - View XYZ/rotation readouts
+      - Auto quality (adaptive sharpness vs FPS)
     """
     def __init__(self, gl: SphereGL):
         super().__init__()
         self.gl = gl
 
-        outer = QVBoxLayout(self)  # FIX: attach to self
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(10)
 
+        title_row = QWidget()
+        title_lay = QHBoxLayout(title_row)
+        title_lay.setContentsMargins(0, 0, 0, 0)
+        title_lay.setSpacing(10)
+
         title = QLabel("Controls")
         title.setStyleSheet("font-size: 18px; font-weight: 650;")
-        outer.addWidget(title)
+        title_lay.addWidget(title, 1)
+
+        self.btn_save = QPushButton("Save Preset")
+        self.btn_load = QPushButton("Load Preset")
+        self.btn_save.clicked.connect(self.save_preset)
+        self.btn_load.clicked.connect(self.load_preset)
+        title_lay.addWidget(self.btn_save)
+        title_lay.addWidget(self.btn_load)
+
+        outer.addWidget(title_row)
 
         row = QWidget()
         row_lay = QHBoxLayout(row)
@@ -338,6 +510,7 @@ class ControlPanel(QWidget):
         row_lay.addWidget(self._section_mode())
         row_lay.addWidget(self._section_audio())
         row_lay.addWidget(self._section_motion())
+        row_lay.addWidget(self._section_transform())
         row_lay.addWidget(self._section_wormhole())
         row_lay.addWidget(self._section_rendering())
         row_lay.addWidget(self._section_colors())
@@ -346,11 +519,16 @@ class ControlPanel(QWidget):
         outer.addWidget(row)
         outer.addStretch(1)
 
+        # live readout updater
+        self._readout_timer = QTimer(self)
+        self._readout_timer.timeout.connect(self._update_readouts)
+        self._readout_timer.start(100)
+
     def _group(self, name: str):
         g = QGroupBox(name)
         g.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        g.setMinimumWidth(240)
-        g.setMaximumWidth(320)
+        g.setMinimumWidth(260)
+        g.setMaximumWidth(360)
         lay = QFormLayout(g)
         lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         lay.setFormAlignment(Qt.AlignmentFlag.AlignTop)
@@ -369,7 +547,7 @@ class ControlPanel(QWidget):
         s.setValue(start)
 
         val = QLabel(fmt(start))
-        val.setFixedWidth(80)
+        val.setFixedWidth(88)
         val.setStyleSheet("font-family: Consolas, monospace;")
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
@@ -383,6 +561,36 @@ class ControlPanel(QWidget):
         layout.addRow(label, row)
         return s
 
+    # ---------- Presets ----------
+    def save_preset(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Preset", "preset.json", "JSON Files (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        data = self.gl.get_state()
+        data["_meta"] = {"app": "ReactiveGeometricSphere", "version": 1, "saved_at": time.time()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def load_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Preset", "", "JSON Files (*.json)")
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.gl.apply_state(data)
+
+    # ---------- Readouts ----------
+    def _update_readouts(self):
+        if hasattr(self, "lbl_pos"):
+            self.lbl_pos.setText(f"({self.gl.pos_x:+.2f}, {self.gl.pos_y:+.2f}, {self.gl.pos_z:+.2f})")
+        if hasattr(self, "lbl_rot"):
+            self.lbl_rot.setText(f"({self.gl.rot_x%360:06.2f}, {self.gl.rot_y%360:06.2f}, {self.gl.rot_z%360:06.2f})")
+        if hasattr(self, "lbl_fps"):
+            self.lbl_fps.setText(f"{self.gl._fps_ema:5.1f} fps")
+
+    # ---------- Sections ----------
     def _section_mode(self):
         g, lay = self._group("Mode")
         mode = QComboBox()
@@ -462,6 +670,29 @@ class ControlPanel(QWidget):
 
         return g
 
+    def _section_transform(self):
+        g, lay = self._group("Transform (XYZ)")
+
+        self._slider_row(lay, "Pos X", -200, 200, int(self.gl.pos_x * 100),
+                         lambda v: setattr(self.gl, "pos_x", v / 100.0),
+                         fmt=lambda v: f"{v/100.0:+.2f}")
+        self._slider_row(lay, "Pos Y", -200, 200, int(self.gl.pos_y * 100),
+                         lambda v: setattr(self.gl, "pos_y", v / 100.0),
+                         fmt=lambda v: f"{v/100.0:+.2f}")
+        self._slider_row(lay, "Pos Z", -200, 200, int(self.gl.pos_z * 100),
+                         lambda v: setattr(self.gl, "pos_z", v / 100.0),
+                         fmt=lambda v: f"{v/100.0:+.2f}")
+
+        self.lbl_pos = QLabel("(+0.00, +0.00, +0.00)")
+        self.lbl_pos.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addRow("Position", self.lbl_pos)
+
+        self.lbl_rot = QLabel("(000.00, 000.00, 000.00)")
+        self.lbl_rot.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addRow("Rotation", self.lbl_rot)
+
+        return g
+
     def _section_wormhole(self):
         g, lay = self._group("Wormhole (Contained)")
 
@@ -492,21 +723,35 @@ class ControlPanel(QWidget):
         return g
 
     def _section_rendering(self):
-        g, lay = self._group("Rendering")
+        g, lay = self._group("Rendering (Adaptive)")
 
-        self._slider_row(lay, "Mesh Layers", 60, 220, int(self.gl.mesh_layers),
+        aq = QCheckBox("Auto Quality")
+        aq.setChecked(self.gl.auto_quality)
+        aq.stateChanged.connect(lambda st: setattr(self.gl, "auto_quality", st == 2))
+        lay.addRow("", aq)
+
+        self._slider_row(lay, "Target FPS", 15, 240, int(self.gl.target_fps),
+                         lambda v: setattr(self.gl, "target_fps", int(v)),
+                         fmt=lambda v: f"{v:d}")
+
+        self.lbl_fps = QLabel(" 60.0 fps")
+        self.lbl_fps.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addRow("Measured", self.lbl_fps)
+
+        # Manual resolution controls still available (Auto Quality can override gently)
+        self._slider_row(lay, "Mesh Layers", self.gl._min_layers, self.gl._max_layers, int(self.gl.mesh_layers),
                          lambda v: setattr(self.gl, "mesh_layers", int(v)),
                          fmt=lambda v: f"{v:d}")
 
-        self._slider_row(lay, "Mesh Segments", 80, 260, int(self.gl.mesh_segments),
+        self._slider_row(lay, "Mesh Segments", self.gl._min_segments, self.gl._max_segments, int(self.gl.mesh_segments),
                          lambda v: setattr(self.gl, "mesh_segments", int(v)),
                          fmt=lambda v: f"{v:d}")
 
-        self._slider_row(lay, "Wire Rings", 8, 60, int(self.gl.wire_rings),
+        self._slider_row(lay, "Wire Rings", self.gl._min_wire_rings, self.gl._max_wire_rings, int(self.gl.wire_rings),
                          lambda v: setattr(self.gl, "wire_rings", int(v)),
                          fmt=lambda v: f"{v:d}")
 
-        self._slider_row(lay, "Wire Segments", 12, 90, int(self.gl.wire_segments),
+        self._slider_row(lay, "Wire Segments", self.gl._min_wire_segments, self.gl._max_wire_segments, int(self.gl.wire_segments),
                          lambda v: setattr(self.gl, "wire_segments", int(v)),
                          fmt=lambda v: f"{v:d}")
 
@@ -548,8 +793,8 @@ class ControlPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Reactive Geometric Sphere (Usable Fullscreen)")
-        self.resize(1400, 900)
+        self.setWindowTitle("Reactive Geometric Sphere (Top Controls + Presets + Adaptive Quality)")
+        self.resize(1500, 900)
 
         self.gl = SphereGL()
         panel = ControlPanel(self.gl)
@@ -559,7 +804,7 @@ class MainWindow(QMainWindow):
         top_scroll.setWidgetResizable(True)
         top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        top_scroll.setFixedHeight(210)  # adjust 180–260
+        top_scroll.setFixedHeight(230)
         top_scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         root = QWidget()
