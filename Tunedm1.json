@@ -1,0 +1,46 @@
+{
+  "beat_gain": 5.0,
+  "vocal_gain": 15.0,
+  "flow_speed": 0.085,
+  "camera_orbit": false,
+  "camera_dist": 6.2,
+  "pos_x": 0.2,
+  "pos_y": 0.2,
+  "pos_z": 0.5,
+  "spin_base": 0.45,
+  "spin_audio": 1.99,
+  "axis_wander": 0.28,
+  "jitter": 1.39,
+  "axis_x": true,
+  "axis_y": true,
+  "axis_z": true,
+  "mesh_color": [
+    0.29411765933036804,
+    1.0,
+    0.9176470637321472
+  ],
+  "wire_color": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "wire_alpha": 0.15,
+  "wire_radius": 1.7,
+  "flow_mode": "sphere",
+  "wh_tunnel_radius": 0.36,
+  "wh_mouth_start": 0.6,
+  "wh_softness": 0.55,
+  "wh_twist": 3.0,
+  "wh_strength": 1.0,
+  "mesh_layers": 60,
+  "mesh_segments": 80,
+  "wire_rings": 10,
+  "wire_segments": 12,
+  "auto_quality": true,
+  "target_fps": 240,
+  "_meta": {
+    "app": "ReactiveGeometricSphere",
+    "version": 1,
+    "saved_at": 1767721129.907613
+  }
+}
